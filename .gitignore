@@ -1,0 +1,7 @@
+olake-data/
+*.log
+.env
+.DS_Store
+*.pid
+*.pyc
+__pycache__/

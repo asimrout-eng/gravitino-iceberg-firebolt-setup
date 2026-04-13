@@ -1,0 +1,8 @@
+{
+    "nodes": [
+        {
+            "host": "localhost"
+        }
+    ],
+    "default_s3_endpoint_override": "http://minio:9000"
+}

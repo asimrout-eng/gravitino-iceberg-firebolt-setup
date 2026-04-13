@@ -1,0 +1,470 @@
+# ============================================================================
+# OLake CDC + Apache Gravitino (Iceberg REST Catalog) + MinIO
+# ============================================================================
+# End-to-end: PostgreSQL CDC → OLake → Iceberg (JDBC catalog + MinIO)
+#             Gravitino exposes the JDBC catalog as a REST API
+#             Firebolt Core reads Iceberg tables via Gravitino REST
+#
+# Services:
+#   primary-postgres        – Source DB with WAL logical replication (port 5431)
+#   iceberg-postgres        – JDBC catalog metastore (port 5433)
+#   minio                   – S3-compatible object storage (ports 19000/19001)
+#   mc                      – MinIO client — creates warehouse bucket
+#   data-loader             – Seeds demo tables + CDC replication slot
+#   temporal-postgresql     – Temporal's internal state store
+#   temporal                – Workflow orchestration engine
+#   olake-ui                – OLake web UI (port 8000)
+#   signup-init             – Creates the admin user
+#   temporal-worker         – Executes OLake sync jobs
+#   gravitino               – Apache Gravitino Iceberg REST server (ports 8090/9002)
+# ============================================================================
+
+x-app-defaults:
+  host_persistence_path: &hostPersistencePath ${PWD}/olake-data
+  worker_config_volume_details: &workerConfigVolumeDetails
+    type: bind
+    source: *hostPersistencePath
+    target: /tmp/olake-config
+
+x-signup-defaults:
+  username: &defaultUsername "admin"
+  password: &defaultPassword "password"
+  email: &defaultEmail "admin@example.com"
+
+x-encryption:
+  key: &encryptionKey ""
+
+x-envs:
+  shared: &sharedEnvs
+    CONTAINER_REGISTRY_BASE: ${CONTAINER_REGISTRY_BASE:-registry-1.docker.io}
+    OLAKE_SECRET_KEY: *encryptionKey
+    PERSISTENT_DIR: *hostPersistencePath
+
+networks:
+  olake-network:
+    driver: bridge
+    name: olake-demo-network
+
+volumes:
+  source-pg-data:
+  iceberg-pg-data:
+  minio-data:
+  temporal-pg-data:
+
+services:
+
+  # =============================================
+  # 1. SOURCE: PostgreSQL with logical replication
+  # =============================================
+  primary-postgres:
+    image: postgres:15
+    container_name: primary-postgres
+    hostname: primary-postgres
+    restart: unless-stopped
+    ports:
+      - "5431:5432"
+    environment:
+      POSTGRES_USER: olake
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: demo
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_wal_senders=10
+        -c max_replication_slots=10
+        -c wal_sender_timeout=0
+    volumes:
+      - source-pg-data:/var/lib/postgresql/data
+    networks:
+      - olake-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "olake", "-d", "demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # =============================================
+  # 2. JDBC CATALOG: PostgreSQL for Iceberg metadata
+  # =============================================
+  iceberg-postgres:
+    image: postgres:15
+    container_name: iceberg-postgres
+    hostname: iceberg-postgres
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: iceberg
+    volumes:
+      - iceberg-pg-data:/var/lib/postgresql/data
+    networks:
+      - olake-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "iceberg", "-d", "iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # =============================================
+  # 3. MINIO: S3-compatible object storage
+  # =============================================
+  minio:
+    image: minio/minio:RELEASE.2025-04-03T14-56-28Z
+    container_name: minio
+    hostname: minio
+    restart: unless-stopped
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+      MINIO_DOMAIN: minio
+    networks:
+      olake-network:
+        aliases:
+          - warehouse.minio
+    volumes:
+      - minio-data:/data
+    command: ["server", "/data", "--console-address", ":9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # =============================================
+  # 4. MC: MinIO client — creates warehouse bucket
+  # =============================================
+  mc:
+    image: minio/mc:RELEASE.2025-04-03T17-07-56Z
+    container_name: mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - olake-network
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+    entrypoint: |
+      /bin/sh -c "
+        echo 'mc: Waiting for MinIO...';
+        until (/usr/bin/mc config host add minio http://minio:9000 admin password) do
+          echo '  ...waiting for minio...' && sleep 2;
+        done;
+        echo 'mc: MinIO ready.';
+        /usr/bin/mc mb --ignore-existing minio/warehouse;
+        /usr/bin/mc anonymous set public minio/warehouse;
+        echo 'mc: bucket warehouse created and set to public.';
+        tail -f /dev/null
+      "
+    restart: "no"
+
+  # =============================================
+  # 5. DATA LOADER: Seeds demo tables + sets up CDC
+  # =============================================
+  data-loader:
+    image: postgres:15
+    container_name: data-loader
+    depends_on:
+      primary-postgres:
+        condition: service_healthy
+    networks:
+      - olake-network
+    environment:
+      PGPASSWORD: password
+    entrypoint: |
+      bash -c "
+        echo '=== DATA LOADER: Setting up source database ===';
+
+        echo '>> Creating tables...';
+        psql -h primary-postgres -U olake -d demo -c \"
+          CREATE TABLE IF NOT EXISTS customers (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            country TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS orders (
+            id SERIAL PRIMARY KEY,
+            customer_id INT REFERENCES customers(id),
+            product TEXT NOT NULL,
+            amount NUMERIC(10,2),
+            status TEXT DEFAULT 'pending',
+            ordered_at TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            category TEXT,
+            price NUMERIC(10,2),
+            stock INT DEFAULT 0
+          );
+        \";
+
+        echo '>> Seeding customers...';
+        psql -h primary-postgres -U olake -d demo -c \"
+          INSERT INTO customers (name, email, country) VALUES
+            ('Alice Johnson',   'alice@example.com',  'USA'),
+            ('Bob Smith',       'bob@example.com',    'UK'),
+            ('Carlos Mendez',   'carlos@example.com', 'Mexico'),
+            ('Diana Prince',    'diana@example.com',  'Germany'),
+            ('Evan Chen',       'evan@example.com',   'China'),
+            ('Fatima Al-Sayed', 'fatima@example.com', 'UAE'),
+            ('George Brown',    'george@example.com', 'Canada'),
+            ('Hannah Lee',      'hannah@example.com', 'South Korea'),
+            ('Ivan Petrov',     'ivan@example.com',   'Russia'),
+            ('Julia Santos',    'julia@example.com',  'Brazil')
+          ON CONFLICT DO NOTHING;
+        \";
+
+        echo '>> Seeding products...';
+        psql -h primary-postgres -U olake -d demo -c \"
+          INSERT INTO products (name, category, price, stock) VALUES
+            ('Laptop Pro 15',              'Electronics',  1299.99, 50),
+            ('Mechanical Keyboard',        'Peripherals',  149.99,  200),
+            ('4K Monitor',                 'Electronics',  399.99,  75),
+            ('USB-C Hub',                  'Peripherals',  49.99,   300),
+            ('Standing Desk',              'Furniture',    599.99,  30),
+            ('Ergonomic Chair',            'Furniture',    349.99,  45),
+            ('Webcam HD',                  'Peripherals',  89.99,   120),
+            ('Noise Cancelling Headphones','Audio',        249.99,  90),
+            ('External SSD 1TB',           'Storage',      109.99,  180),
+            ('Smart Watch',                'Wearables',    199.99,  60)
+          ON CONFLICT DO NOTHING;
+        \";
+
+        echo '>> Seeding orders...';
+        psql -h primary-postgres -U olake -d demo -c \"
+          INSERT INTO orders (customer_id, product, amount, status) VALUES
+            (1,  'Laptop Pro 15',              1299.99, 'completed'),
+            (1,  'Mechanical Keyboard',        149.99,  'completed'),
+            (2,  '4K Monitor',                 399.99,  'shipped'),
+            (3,  'USB-C Hub',                  49.99,   'pending'),
+            (4,  'Standing Desk',              599.99,  'completed'),
+            (5,  'Ergonomic Chair',            349.99,  'shipped'),
+            (6,  'Webcam HD',                  89.99,   'pending'),
+            (7,  'Noise Cancelling Headphones',249.99,  'completed'),
+            (8,  'External SSD 1TB',           109.99,  'shipped'),
+            (9,  'Smart Watch',                199.99,  'pending'),
+            (10, 'Laptop Pro 15',              1299.99, 'processing'),
+            (2,  'USB-C Hub',                  49.99,   'completed');
+        \";
+
+        echo '>> Creating publication for CDC (ALL TABLES)...';
+        psql -h primary-postgres -U olake -d demo -c \"
+          DO \\\$\\\$
+          BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'olake_pub') THEN
+              CREATE PUBLICATION olake_pub FOR ALL TABLES
+                WITH (publish = 'insert,update,delete,truncate');
+              RAISE NOTICE 'Publication olake_pub created.';
+            ELSE
+              RAISE NOTICE 'Publication olake_pub already exists.';
+            END IF;
+          END
+          \\\$\\\$;
+        \";
+
+        echo '>> Creating logical replication slot...';
+        psql -h primary-postgres -U olake -d demo -c \"
+          SELECT CASE
+            WHEN EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = 'olake_slot')
+            THEN 'Slot olake_slot already exists.'
+            ELSE (SELECT 'Slot created: ' || slot_name FROM pg_create_logical_replication_slot('olake_slot', 'pgoutput'))
+          END AS result;
+        \";
+
+        echo '=== DATA LOADER: All done! ===';
+        echo '  Tables:      customers, orders, products';
+        echo '  Publication: olake_pub';
+        echo '  Repl Slot:   olake_slot';
+      "
+    restart: "no"
+
+  # =============================================
+  # 6. TEMPORAL PostgreSQL (OLake internal)
+  # =============================================
+  temporal-postgresql:
+    image: postgres:13
+    container_name: demo-temporal-postgresql
+    hostname: demo-temporal-postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+    networks:
+      olake-network:
+        aliases:
+          - postgresql
+    volumes:
+      - temporal-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -h localhost -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =============================================
+  # 7. TEMPORAL: Workflow engine
+  # =============================================
+  temporal:
+    image: temporalio/auto-setup:1.22.3
+    container_name: demo-temporal
+    hostname: temporal
+    restart: unless-stopped
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=demo-temporal-postgresql
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CLI_ADDRESS=temporal:7233
+    networks:
+      - olake-network
+
+  # =============================================
+  # 8. OLAKE UI: Web interface
+  # =============================================
+  olake-ui:
+    image: olakego/ui:latest
+    pull_policy: always
+    container_name: demo-olake-ui
+    restart: unless-stopped
+    depends_on:
+      temporal-postgresql:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    environment:
+      <<: *sharedEnvs
+      MAX_MEMORY: 67108864
+      MAX_UPLOAD_SIZE: 67108864
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - <<: *workerConfigVolumeDetails
+    networks:
+      - olake-network
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8000"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # =============================================
+  # 9. SIGNUP INIT: Creates the admin user once
+  # =============================================
+  signup-init:
+    image: curlimages/curl:latest
+    container_name: demo-olake-signup-init
+    restart: "no"
+    depends_on:
+      olake-ui:
+        condition: service_healthy
+    networks:
+      - olake-network
+    environment:
+      USERNAME: *defaultUsername
+      PASSWORD: *defaultPassword
+      EMAIL: *defaultEmail
+      OLAKE_APP_URL: "http://demo-olake-ui:8000/signup"
+    command: >
+      sh -c "
+        echo 'signup-init: Creating admin user...';
+        JSON_PAYLOAD=$$(printf '{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"%s\"}' \"$${USERNAME}\" \"$${PASSWORD}\" \"$${EMAIL}\");
+        HTTP_CODE=$$(/usr/bin/curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d \"$${JSON_PAYLOAD}\" \"$${OLAKE_APP_URL}\");
+        echo \"\";
+        if [ \"$${HTTP_CODE}\" -ge 200 ] && [ \"$${HTTP_CODE}\" -lt 300 ]; then
+          echo \"signup-init: Admin user created (HTTP $${HTTP_CODE})\";
+        else
+          echo \"signup-init: Signup returned HTTP $${HTTP_CODE} (user may already exist)\";
+        fi;
+      "
+
+  # =============================================
+  # 10. TEMPORAL WORKER: Runs OLake sync jobs
+  # =============================================
+  temporal-worker:
+    image: olakego/ui-worker:latest
+    pull_policy: always
+    container_name: demo-olake-temporal-worker
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_started
+      olake-ui:
+        condition: service_healthy
+    environment:
+      <<: *sharedEnvs
+      OLAKE_CALLBACK_URL: "http://demo-olake-ui:8000/internal/worker/callback"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - <<: *workerConfigVolumeDetails
+    networks:
+      - olake-network
+
+  # =============================================
+  # 11. SAMPLE AUTH SERVER: OAuth2 token endpoint
+  #     Pre-configured: clientId=test, clientSecret=test, scope=test
+  #     Gravitino validates JWTs via JWKS from this server.
+  # =============================================
+  sample-auth-server:
+    image: datastrato/sample-authorization-server:0.3.0
+    container_name: sample-auth-server
+    hostname: sample-auth-server
+    restart: unless-stopped
+    ports:
+      - "8177:8177"
+    networks:
+      - olake-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8177/oauth2/jwks || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # =============================================
+  # 12. GRAVITINO: Iceberg REST Catalog Server
+  #     Proxies the same JDBC catalog that OLake writes to.
+  #     Firebolt Core authenticates via OAuth2 and reads Iceberg tables.
+  # =============================================
+  gravitino:
+    build: ./gravitino
+    container_name: gravitino
+    hostname: gravitino
+    restart: unless-stopped
+    ports:
+      - "8090:8090"    # Management API + Web UI
+      - "9002:9001"    # Iceberg REST API
+    environment:
+      GRAVITINO_MEM: "-Xms1g -Xmx1g -XX:MaxMetaspaceSize=512m"
+      GRAVITINO_ICEBERG_REST_CATALOG_BACKEND: "jdbc"
+      GRAVITINO_ICEBERG_REST_WAREHOUSE: "s3a://warehouse"
+    depends_on:
+      iceberg-postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      sample-auth-server:
+        condition: service_healthy
+    networks:
+      - olake-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8090/api/version || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 45s
