@@ -129,7 +129,7 @@ gravitino.iceberg-rest.s3-access-key-id = admin
 gravitino.iceberg-rest.s3-secret-access-key = password
 ```
 
-For production with AWS S3, remove `s3-endpoint` and `s3-path-style-access`, and use IAM credentials or IRSA instead of static keys.
+For your production MinIO, update `s3-endpoint` to your MinIO host and update the access keys. Keep `s3-path-style-access = true` (required for MinIO).
 
 ### Credential Vending
 
@@ -145,9 +145,8 @@ Available credential providers in Gravitino 1.2.0:
 |---|---|---|
 | S3 Secret Key | s3-secret-key | Passthrough static keys (MinIO, dev environments) |
 | S3 Token | s3-token | STS AssumeRole with static keys |
-| AWS IRSA | aws-irsa | EKS pods with IAM Roles for Service Accounts |
 
-For production on EKS with IRSA, use `aws-irsa` instead of `s3-secret-key`.
+For MinIO deployments, `s3-secret-key` is the correct provider.
 
 ### Custom Gravitino Docker Image
 
@@ -331,12 +330,27 @@ SELECT * FROM READ_ICEBERG(
 
 ## Adapting for Production
 
-### Replacing MinIO with AWS S3
+### MinIO Configuration
 
-1. In `gravitino/gravitino.conf`, remove `s3-endpoint` and `s3-path-style-access`
-2. Set `s3-access-key-id` and `s3-secret-access-key` to real IAM credentials, or use `aws-irsa` credential provider on EKS
-3. Update `warehouse` to your S3 bucket path (e.g., `s3a://my-bucket/iceberg`)
-4. In `firebolt-core-config.json`, remove `default_s3_endpoint_override`
+This setup is configured for MinIO out of the box. For your production MinIO deployment, update these values in `gravitino/gravitino.conf`:
+
+```properties
+gravitino.iceberg-rest.s3-endpoint = http://<your-minio-host>:9000
+gravitino.iceberg-rest.s3-access-key-id = <your-minio-access-key>
+gravitino.iceberg-rest.s3-secret-access-key = <your-minio-secret-key>
+gravitino.iceberg-rest.s3-path-style-access = true
+```
+
+And in `firebolt-core-config.json`, point to your MinIO instance:
+
+```json
+{
+    "nodes": [{ "host": "localhost" }],
+    "default_s3_endpoint_override": "http://<your-minio-host>:9000"
+}
+```
+
+Keep `s3-path-style-access = true` -- this is required for MinIO.
 
 ### Replacing the Demo OAuth2 Server
 
