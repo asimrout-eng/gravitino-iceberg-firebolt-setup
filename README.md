@@ -123,13 +123,26 @@ gravitino.iceberg-rest.catalog-backend-name = olake_iceberg
 ```properties
 gravitino.iceberg-rest.io-impl = org.apache.iceberg.aws.s3.S3FileIO
 gravitino.iceberg-rest.s3-endpoint = http://minio:9000
-gravitino.iceberg-rest.s3-region = us-east-1
 gravitino.iceberg-rest.s3-path-style-access = true
 gravitino.iceberg-rest.s3-access-key-id = admin
 gravitino.iceberg-rest.s3-secret-access-key = password
 ```
 
 For your production MinIO, update `s3-endpoint` to your MinIO host and update the access keys. Keep `s3-path-style-access = true` (required for MinIO).
+
+**Important -- do NOT put `s3-region` in `gravitino.conf`.**
+
+Gravitino's internal AWS SDK needs a region value to initialize its S3 client. However, if you set `s3-region` in `gravitino.conf`, Gravitino will include a `client.region` field in the credential vending response it sends to query engines. Firebolt Core interprets `client.region` as a signal that the credentials are temporary AWS STS tokens (with a session token), and rejects static MinIO keys with the error: `"Can't have region without vended credentials"`.
+
+The solution is to provide the region via the `AWS_REGION` environment variable in `docker-compose.yml` instead. The env var is consumed internally by Gravitino's AWS SDK but is NOT included in the credential vending response to Firebolt:
+
+```yaml
+# In docker-compose.yml, under the gravitino service:
+environment:
+  AWS_REGION: "us-east-1"   # used internally by AWS SDK, not vended to clients
+```
+
+This is already configured in the provided `docker-compose.yml`.
 
 ### Credential Vending
 
@@ -267,7 +280,7 @@ docker run --detach --name firebolt-core --hostname firebolt-core \
     --publish 127.0.0.1:3473:3473 \
     --network olake-demo-network \
     --mount type=bind,src=$(pwd)/firebolt-core-config.json,dst=/firebolt-core/config.json,readonly \
-    ghcr.io/firebolt-db/firebolt-core:preview-rc
+    ghcr.io/firebolt-db/firebolt-core:4.31.12-0.20260413152700.ffcbadbccd43
 ```
 
 Wait ~15 seconds for the engine to start.
@@ -341,6 +354,8 @@ gravitino.iceberg-rest.s3-secret-access-key = <your-minio-secret-key>
 gravitino.iceberg-rest.s3-path-style-access = true
 ```
 
+Do NOT add `s3-region` to `gravitino.conf`. Instead, set the region via the `AWS_REGION` environment variable in your Docker Compose or deployment config (see the S3 / MinIO Storage Configuration section above for the full explanation).
+
 And in `firebolt-core-config.json`, point to your MinIO instance:
 
 ```json
@@ -350,7 +365,7 @@ And in `firebolt-core-config.json`, point to your MinIO instance:
 }
 ```
 
-Keep `s3-path-style-access = true` -- this is required for MinIO.
+Keep `s3-path-style-access = true` -- this is required for MinIO. The `default_s3_endpoint_override` is required so Firebolt Core reads data from MinIO instead of trying to reach AWS S3.
 
 ### Replacing the Demo OAuth2 Server
 
@@ -422,6 +437,7 @@ make clean             Stop + remove all volumes
 | Gravitino 404: "NoSuchCatalogException" | WAREHOUSE param not empty | Set `WAREHOUSE = ''` (empty) in `CREATE LOCATION` |
 | Gravitino container keeps restarting | Config bind-mount issue | Configs must be COPY'd in Dockerfile, not bind-mounted (already handled) |
 | "Device or resource busy" in Gravitino logs | Docker bind-mount conflict with startup script | Use the provided Dockerfile (bakes configs into the image) |
+| "Can't have region without vended credentials" | `s3-region` is set in `gravitino.conf`, causing Gravitino to vend `client.region` to Firebolt | Remove `s3-region` from `gravitino.conf` and set `AWS_REGION` as an environment variable in Docker Compose instead |
 
 ---
 

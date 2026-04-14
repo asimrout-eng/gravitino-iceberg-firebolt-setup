@@ -453,6 +453,7 @@ services:
       GRAVITINO_MEM: "-Xms1g -Xmx1g -XX:MaxMetaspaceSize=512m"
       GRAVITINO_ICEBERG_REST_CATALOG_BACKEND: "jdbc"
       GRAVITINO_ICEBERG_REST_WAREHOUSE: "s3a://warehouse"
+      AWS_REGION: "us-east-1"
     depends_on:
       iceberg-postgres:
         condition: service_healthy
